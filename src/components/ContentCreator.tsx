@@ -1,11 +1,16 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { MarkdownRenderer } from "@/components/MarkdownRenderer";
 import { generateMarkdown, generatePlaceholderMarkdown } from "@/utils/generateMarkdown";
-import { Copy, Download, Eye, ArrowLeft } from "lucide-react";
+import { Copy, Download, Eye, ArrowLeft, CheckCircle, Clock, Loader2 } from "lucide-react";
+
+interface ToolUseStatus {
+  name: string;
+  complete: boolean;
+}
 
 interface ContentCreationResult {
   research_summary: string;
@@ -18,6 +23,7 @@ interface ContentCreationResult {
     timestamp: string;
     execution_time_seconds: number;
     status: string;
+    tool_used: ToolUseStatus[];
   };
 }
 
@@ -29,6 +35,7 @@ export function ContentCreator() {
   const [result, setResult] = useState<ContentCreationResult | null>(null);
   const [error, setError] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>('form');
+  const [realtimeTools, setRealtimeTools] = useState<ToolUseStatus[]>([]);
 
   const handleSubmit = async () => {
     if (!prompt.trim()) return;
@@ -36,9 +43,11 @@ export function ContentCreator() {
     setLoading(true);
     setError("");
     setResult(null);
+    setRealtimeTools([]);
 
     try {
-      const response = await fetch("http://localhost:8000/workflow/create", {
+      // For POST endpoint with SSE, we'll use fetch with reader
+      const response = await fetch("http://localhost:8000/workflow/create-stream", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -53,11 +62,63 @@ export function ContentCreator() {
         throw new Error(`API error: ${response.status}`);
       }
 
-      const data = await response.json();
-      setResult(data);
+      // Read the stream
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          // Decode and add to buffer
+          buffer += decoder.decode(value, { stream: true });
+          
+          // Process complete SSE messages
+          const messages = buffer.split('\n\n');
+          buffer = messages.pop() || ''; // Keep incomplete message in buffer
+          
+          for (const message of messages) {
+            const lines = message.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  
+                  if (data.type === 'tool_update') {
+                    setRealtimeTools(prev => {
+                      const existing = prev.find(t => t.name === data.tool);
+                      if (existing) {
+                        return prev.map(t => 
+                          t.name === data.tool 
+                            ? { ...t, complete: data.status === 'completed' }
+                            : t
+                        );
+                      }
+                      return [...prev, { 
+                        name: data.tool, 
+                        complete: data.status === 'completed' 
+                      }];
+                    });
+                  } else if (data.type === 'complete') {
+                    setResult(data.result);
+                    setLoading(false);
+                    setRealtimeTools([]);
+                  } else if (data.type === 'error') {
+                    setError(data.message || "An error occurred");
+                    setLoading(false);
+                  }
+                } catch (e) {
+                  console.error('Failed to parse SSE data:', e);
+                }
+              }
+            }
+          }
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create content");
-    } finally {
       setLoading(false);
     }
   };
@@ -188,6 +249,33 @@ export function ContentCreator() {
         </Card>
       )}
 
+      {/* Real-time progress display */}
+      {loading && realtimeTools.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              Creating Content...
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {realtimeTools.map((tool, index) => (
+                <div key={index} className="flex items-center gap-2 text-sm">
+                  {tool.complete ? (
+                    <CheckCircle className="h-4 w-4 text-green-500" />
+                  ) : (
+                    <Loader2 className="h-4 w-4 text-yellow-500 animate-spin" />
+                  )}
+                  <span className={tool.complete ? "text-green-700" : "text-yellow-700"}>
+                    {tool.name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {result && (
         <Card>
           <CardHeader>
@@ -230,6 +318,27 @@ export function ContentCreator() {
               <p><span className="font-medium">Execution Time:</span> {result.metadata.execution_time_seconds.toFixed(2)}s</p>
               <p><span className="font-medium">Status:</span> <span className="text-green-600 font-medium">{result.metadata.status}</span></p>
             </div>
+            
+            {/* Tool Usage Progress */}
+            {result.metadata.tool_used && result.metadata.tool_used.length > 0 && (
+              <div>
+                <Label className="text-sm font-medium">Workflow Progress</Label>
+                <div className="mt-2 space-y-2">
+                  {result.metadata.tool_used.map((tool, index) => (
+                    <div key={index} className="flex items-center gap-2 text-sm">
+                      {tool.complete ? (
+                        <CheckCircle className="h-4 w-4 text-green-500" />
+                      ) : (
+                        <Clock className="h-4 w-4 text-yellow-500" />
+                      )}
+                      <span className={tool.complete ? "text-green-700" : "text-yellow-700"}>
+                        {tool.name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             
             <div>
               <Label className="text-sm font-medium">Research Summary</Label>
